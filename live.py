@@ -10,7 +10,8 @@ Audio I/O reuses the PulseAudio/PipeWire CLI tools the rest of the
 project already uses (parecord / paplay), so no PortAudio build needed.
 
 Config:
-  GEMINI_API_KEY or ~/.config/siwc-chat/gemini-key
+  GEMINI_API_KEY in the repo's .env (see .env.example), the environment,
+                 or ~/.config/siwc-chat/gemini-key
   GEMINI_LIVE_MODEL   (default below; set to whatever Live model you have)
   GEMINI_LIVE_VOICE   (default Zephyr)
   SIWC_LIVE_HEADPHONES=1  keep the mic open while the model talks
@@ -37,7 +38,25 @@ DEFAULT_MODEL = "models/gemini-3.8-live"  # from the Gemini quickstart; override
 DEFAULT_VOICE = "Zephyr"
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from the repo's .env (real env vars win)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip().strip("\"'")
+        if v:
+            os.environ.setdefault(k.strip(), v)
+
+
 def _api_key() -> str:
+    _load_dotenv()
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
         try:
@@ -100,6 +119,7 @@ async def run(system_instruction: str) -> None:
     from google import genai
     from google.genai import types
 
+    _load_dotenv()
     model = os.environ.get("GEMINI_LIVE_MODEL", DEFAULT_MODEL)
     voice = os.environ.get("GEMINI_LIVE_VOICE", DEFAULT_VOICE)
     headphones = os.environ.get("SIWC_LIVE_HEADPHONES") == "1"
