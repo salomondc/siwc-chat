@@ -6,8 +6,8 @@ taking, barge-in, and speech synthesis natively, replacing the
 STT -> OpenAI text -> TTS chain in voice.py. The OpenAI/OAuth path in
 chat.py is untouched and stays available for orchestration.
 
-Audio I/O reuses the PulseAudio/PipeWire CLI tools the rest of the
-project already uses (parecord / paplay), so no PortAudio build needed.
+Audio I/O uses sounddevice (PortAudio), so it works on Linux, macOS
+and Windows.
 
 Config:
   GEMINI_API_KEY in the repo's .env (see .env.example), the environment,
@@ -21,9 +21,9 @@ Config:
 """
 import asyncio
 import os
-import shutil
-import subprocess
 import sys
+import threading
+import time
 
 import logger
 
@@ -32,7 +32,6 @@ KEY_FILE = os.path.join(APP_DIR, "gemini-key")
 
 SEND_RATE = 16000
 RECV_RATE = 24000
-CHUNK_BYTES = SEND_RATE * 2 * 40 // 1000  # 40 ms of s16le mono
 
 DEFAULT_MODEL = "models/gemini-3.8-live"  # from the Gemini quickstart; override via env
 DEFAULT_VOICE = "Zephyr"
@@ -69,50 +68,53 @@ def _api_key() -> str:
 
 
 class Player:
-    """Streaming raw-PCM playback via paplay; flush() kills queued audio."""
+    """Streaming PCM playback via sounddevice; flush() drops queued audio."""
+
+    TAIL_S = 0.3  # keep "playing" briefly after the buffer drains (speaker tail)
 
     def __init__(self):
-        self.paplay = shutil.which("paplay")
-        if not self.paplay:
-            raise RuntimeError("paplay not found")
-        self.proc = None
-        self.playing = False
+        import sounddevice as sd
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._last_audio = 0.0
+        self.stream = sd.RawOutputStream(
+            samplerate=RECV_RATE, channels=1, dtype="int16",
+            blocksize=0, callback=self._callback)
+        self.stream.start()
 
-    def _spawn(self):
-        self.proc = subprocess.Popen(
-            [self.paplay, "--raw", "--format=s16le", f"--rate={RECV_RATE}",
-             "--channels=1", "--latency-msec=60"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    def _callback(self, outdata, frames, _time, _status):
+        n = frames * 2
+        with self._lock:
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+        if chunk:
+            self._last_audio = time.monotonic()
+        outdata[:len(chunk)] = chunk
+        outdata[len(chunk):] = b"\x00" * (n - len(chunk))
+
+    @property
+    def playing(self) -> bool:
+        with self._lock:
+            if self._buf:
+                return True
+        return time.monotonic() - self._last_audio < self.TAIL_S
 
     def write(self, pcm: bytes) -> None:
-        if self.proc is None or self.proc.poll() is not None:
-            self._spawn()
-        try:
-            self.proc.stdin.write(pcm)
-            self.proc.stdin.flush()
-            self.playing = True
-        except (BrokenPipeError, OSError):
-            self.proc = None
+        with self._lock:
+            self._buf += pcm
 
     def flush(self) -> None:
         """Barge-in: drop whatever is still buffered."""
-        if self.proc is not None:
-            self.proc.kill()
-            self.proc = None
-        self.playing = False
+        with self._lock:
+            self._buf.clear()
+        self._last_audio = 0.0
 
     def finish(self) -> None:
-        """Turn done: let queued audio drain, then close."""
-        if self.proc is not None:
-            try:
-                self.proc.stdin.close()
-            except OSError:
-                pass
-            proc, self.proc = self.proc, None
-            proc.wait()
-        self.playing = False
+        """Turn done: audio already queued keeps playing; nothing to do."""
 
-    close = flush
+    def close(self) -> None:
+        self.stream.stop()
+        self.stream.close()
 
 
 async def run(system_instruction: str) -> None:
@@ -138,14 +140,21 @@ async def run(system_instruction: str) -> None:
             sliding_window=types.SlidingWindow(target_tokens=52428)),
     )
 
-    parecord = shutil.which("parecord")
-    if not parecord:
-        raise RuntimeError("parecord not found")
+    import sounddevice as sd
     player = Player()
-    mic = subprocess.Popen(
-        [parecord, "--raw", "--format=s16le", f"--rate={SEND_RATE}",
-         "--channels=1", "--latency-msec=40"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    loop = asyncio.get_running_loop()
+    mic_q: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+    def _mic_cb(indata, _frames, _time, _status):
+        try:
+            loop.call_soon_threadsafe(mic_q.put_nowait, bytes(indata))
+        except (asyncio.QueueFull, RuntimeError):
+            pass
+
+    mic = sd.RawInputStream(
+        samplerate=SEND_RATE, channels=1, dtype="int16",
+        blocksize=SEND_RATE * 40 // 1000, callback=_mic_cb)
+    mic.start()
 
     logger.log("session_start", mode="live", model=model, voice=voice,
                headphones=headphones)
@@ -158,9 +167,7 @@ async def run(system_instruction: str) -> None:
 
             async def send_mic():
                 while True:
-                    data = await asyncio.to_thread(mic.stdout.read, CHUNK_BYTES)
-                    if not data:
-                        return
+                    data = await mic_q.get()
                     if player.playing and not headphones:
                         continue  # half-duplex: don't hear ourselves
                     await session.send_realtime_input(
@@ -173,7 +180,7 @@ async def run(system_instruction: str) -> None:
                     async for msg in session.receive():
                         sc = msg.server_content
                         if msg.data:
-                            await asyncio.to_thread(player.write, msg.data)
+                            player.write(msg.data)
                         if sc is None:
                             continue
                         if sc.interrupted:
@@ -184,7 +191,7 @@ async def run(system_instruction: str) -> None:
                         if sc.output_transcription and sc.output_transcription.text:
                             model_buf.append(sc.output_transcription.text)
                         if sc.turn_complete:
-                            await asyncio.to_thread(player.finish)
+                            player.finish()
                             u, m = "".join(user_buf).strip(), "".join(model_buf).strip()
                             user_buf.clear()
                             model_buf.clear()
@@ -198,7 +205,8 @@ async def run(system_instruction: str) -> None:
 
             await asyncio.gather(send_mic(), receive())
     finally:
-        mic.kill()
+        mic.stop()
+        mic.close()
         player.close()
 
 

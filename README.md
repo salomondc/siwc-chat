@@ -9,13 +9,31 @@ Terminal voice chat with two backends:
 
 ## Setup
 
-Requires Python 3.10+ and PulseAudio/PipeWire CLI tools (`parecord`, `paplay`).
+Requires Python 3.10+. Gemini Live mode (`--live`) uses `sounddevice`, so it runs on
+Linux, macOS and Windows. On Linux you need the PortAudio library
+(`sudo pacman -S portaudio` / `sudo apt install libportaudio2`); macOS and Windows
+wheels bundle it.
+
+Linux / macOS:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env      # then set GEMINI_API_KEY
 ```
+
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env    # then set GEMINI_API_KEY
+```
+
+On Windows, use `.venv\Scripts\python` in place of `.venv/bin/python` below.
+
+The OpenAI voice mode still records with `parecord`/`paplay` (Linux only); on
+Windows use `--text` for that backend.
 
 ## Run
 
