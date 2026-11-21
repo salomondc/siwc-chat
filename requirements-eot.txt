@@ -1,0 +1,2 @@
+# optional: Laya end-of-turn detection for the OpenAI voice mode (SIWC_EOT=laya)
+laya
